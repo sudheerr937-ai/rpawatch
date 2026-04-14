@@ -1,139 +1,129 @@
 # RPAWatch
 
-Open-source observability framework that bridges **UiPath Orchestrator** (Cloud
-and On-Premises) with **AppSignal** to give government and critical infrastructure
-teams production-grade RPA monitoring.
+Open-source observability and self-healing framework that bridges **UiPath Orchestrator** (Cloud and On-Premises) with **AppSignal** to give government and critical infrastructure teams production-grade RPA monitoring.
 
 ## Why this exists
 
-Government agencies and critical infrastructure operators are deploying UiPath
-RPA at scale — but most deployments have no real-time observability. A faulted
-robot in a benefits-processing pipeline or a utility management workflow can
-silently fail for hours before anyone notices.
+Government agencies and critical infrastructure operators are deploying UiPath RPA at scale — but most deployments have no real-time observability. A faulted robot in a benefits-processing pipeline or a utility management workflow can silently fail for hours before anyone notices.
 
-RPAWatch closes that gap by continuously collecting health signals from
-Orchestrator and pushing them into AppSignal, where you can build dashboards,
-set alert thresholds, and trigger automated remediation workflows.
+RPAWatch closes that gap by continuously collecting health signals from Orchestrator and pushing them into AppSignal, where you can build dashboards, set alert thresholds, and trigger automated remediation workflows.
 
 ---
 
 ## Architecture
 
 ```
-UiPath Orchestrator               RPAWatch               AppSignal
-(Cloud or On-Prem)                (this repo)
-      │                                │                           │
-      │  Jobs / Queues / Robots        │   Gauges / Counters       │
-      │ ──────────────────────────►   │ ────────────────────────► │
-      │  OData API (every 60s)        │   Custom metrics API      │
-                                                                   │
-                                                        Dashboards + Alerts
-                                                                   │
-                                                          Webhook → UiPath
-                                                        (self-healing layer)
+UiPath Orchestrator          RPAWatch Collector         AppSignal
+(Cloud or On-Prem)           (Python)
+      │                            │                         │
+      │  Jobs / Queues / Robots    │   Custom metrics        │
+      │ ─────────────────────────► │ ──────────────────────► │
+      │  OData API (every 60s)     │                         │
+                                                             │
+                                                  Dashboards + Alerts
+                                                             │
+                                                    Webhook fired
+                                                             │
+                                              RPAWatch Webhook Receiver
+                                                    (Node.js)
+                                                             │
+                                                    UiPath Orchestrator
+                                                  (remediation process)
 ```
 
 ---
 
 ## Metrics collected
 
-### Jobs (`uipath.jobs.*`)
+### Jobs
 | Metric | Type | Tags | Description |
 |---|---|---|---|
-| `uipath.jobs.total` | Gauge | `process` | Total jobs in lookback window |
-| `uipath.jobs.faulted` | Gauge | `process` | Faulted job count |
 | `uipath.jobs.faulted_rate` | Gauge | `process` | % faulted of completed jobs |
 | `uipath.jobs.running` | Gauge | `process` | Currently running jobs |
 | `uipath.jobs.duration_seconds` | Distribution | `process` | Job execution duration |
 
-### Queues (`uipath.queue.*`)
+### Queues
 | Metric | Type | Tags | Description |
 |---|---|---|---|
 | `uipath.queue.pending` | Gauge | `queue` | Items waiting to be processed |
-| `uipath.queue.in_progress` | Gauge | `queue` | Items being processed |
-| `uipath.queue.failed` | Gauge | `queue` | Failed items |
 | `uipath.queue.failed_rate` | Gauge | `queue` | % failed of processed items |
 
-### Robots (`uipath.robots.*`)
+### Robots
 | Metric | Type | Description |
 |---|---|---|
-| `uipath.robots.available` | Gauge | Available robots |
-| `uipath.robots.busy` | Gauge | Currently executing robots |
-| `uipath.robots.disconnected` | Gauge | Disconnected robots (critical alert) |
-| `uipath.robots.utilization_rate` | Gauge | busy / (available + busy) × 100 |
-
-### Collector health (`uipath.collector.*`)
-| Metric | Type | Description |
-|---|---|---|
-| `uipath.collector.poll_success` | Gauge | 1 = success, 0 = failed poll |
-| `uipath.collector.poll_duration_ms` | Distribution | Time to complete one poll cycle |
-
----
-
-## Recommended AppSignal alert rules
-
-| Metric | Condition | Severity | Why |
-|---|---|---|---|
-| `uipath.jobs.faulted_rate` | > 20% | Critical | Process is failing at scale |
-| `uipath.queue.pending` | > 500 | Warning | Backlog building up |
-| `uipath.robots.disconnected` | > 0 | Critical | Robots offline |
-| `uipath.robots.utilization_rate` | > 90% | Warning | Fleet at capacity |
-| `uipath.collector.poll_success` | = 0 | Critical | Sentinel itself is down |
+| `uipath.robots.disconnected` | Gauge | Disconnected robots |
+| `uipath.robots.utilization_rate` | Gauge | Fleet utilization % |
 
 ---
 
 ## Setup
 
-### 1. Clone and configure
-
+### 1. Clone the repo
 ```bash
-git clone https://github.com/your-username/rpawatch
+git clone https://github.com/sudheerr937-ai/rpawatch
 cd rpawatch
 cp .env.example .env
-# Edit .env with your credentials
 ```
 
-### 2. Install dependencies
+### 2. Get credentials
 
+**AppSignal:** App Settings → Push & Deploy → copy Push API key
+
+**UiPath Personal Access Token:**
+1. cloud.uipath.com → Profile → Personal Access Tokens
+2. Add Token, name it `RPAWatch`, expiry 365 days
+3. Add scopes: OR.Jobs, OR.Queues, OR.Robots, OR.Folders (+ Read variants)
+4. Copy token immediately
+
+### 3. Run with Docker
 ```bash
+docker-compose up -d
+```
+
+### 4. Run without Docker
+```bash
+# Collector
+python -m venv venv && venv\Scripts\activate
 pip install -r requirements.txt
-```
-
-### 3. Run
-
-```bash
 python -m collector.main
-```
 
-### 4. Run with Docker
-
-```bash
-docker build -t rpawatch .
-docker run --env-file .env rpawatch
+# Webhook receiver
+cd webhook && npm install && npm start
 ```
 
 ---
 
-## Getting credentials
+## Remediation workflows
 
-### AppSignal
-1. Log in to AppSignal → App Settings → Push & Deploy → copy your **Push API key**
+| Process | Trigger | Action |
+|---|---|---|
+| `RPAWatch_RestartFaultedJob` | Job faulted rate > threshold | Restarts the process |
+| `RPAWatch_RequeueFailedItems` | Queue failure rate > threshold | Retries failed items |
+| `RPAWatch_EscalateToHuman` | Unrecoverable alert | Creates incident, notifies team |
 
-### UiPath Automation Cloud
-1. Go to **Admin → External Applications → Add Application**
-2. Select **Confidential application**
-3. Add scopes: `OR.Robots OR.Jobs OR.Queues OR.Folders`
-4. Copy the **Client ID** and **Client Secret**
+---
 
-### UiPath On-Premises
-Use a service account username and password with **Orchestrator API** role.
+## Testing locally
+```bash
+curl -X POST http://localhost:3000/webhook/test \
+  -H "Content-Type: application/json" \
+  -d '{"metric":"uipath.jobs.faulted_rate","value":35,"threshold":20,"tags":{"process":"InvoiceProcessor"}}'
+```
+
+---
+
+## Government compliance
+
+- Full audit log for every automated remediation action
+- No sensitive data transmitted — only metric names and values
+- Deployable on-premises for air-gapped environments
+- Designed with FISMA/FedRAMP requirements in mind
 
 ---
 
 ## Contributing
 
-Contributions welcome — especially around additional metrics, FISMA/FedRAMP
-compliance logging, and support for additional Orchestrator API versions.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Contributions welcome especially around compliance logging and additional metrics.
 
 ---
 
