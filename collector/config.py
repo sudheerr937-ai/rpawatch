@@ -8,19 +8,18 @@ load_dotenv()
 
 @dataclass
 class OrchestratorConfig:
-    """
-    Supports both UiPath Automation Cloud and On-Premises Orchestrator.
-    Set UIPATH_MODE=cloud or UIPATH_MODE=onprem in your .env file.
-    """
     mode: str
 
-    # Cloud credentials
+    # PAT (Community plan)
+    personal_access_token: Optional[str] = None
+
+    # Cloud OAuth2 (Enterprise)
     client_id: Optional[str] = None
     client_secret: Optional[str] = None
     organization: Optional[str] = None
     tenant: Optional[str] = None
 
-    # On-prem credentials
+    # On-prem
     base_url: Optional[str] = None
     username: Optional[str] = None
     password: Optional[str] = None
@@ -31,8 +30,16 @@ class OrchestratorConfig:
 
     @classmethod
     def from_env(cls):
-        mode = os.getenv("UIPATH_MODE", "cloud").lower()
-        if mode == "cloud":
+        mode = os.getenv("UIPATH_MODE", "pat").lower()
+        if mode == "pat":
+            return cls(
+                mode="pat",
+                personal_access_token=os.environ["UIPATH_PERSONAL_ACCESS_TOKEN"],
+                organization=os.environ["UIPATH_ORGANIZATION"],
+                tenant=os.environ["UIPATH_TENANT"],
+                folder_id=os.getenv("UIPATH_FOLDER_ID"),
+            )
+        elif mode == "cloud":
             return cls(
                 mode="cloud",
                 client_id=os.environ["UIPATH_CLIENT_ID"],
@@ -53,7 +60,7 @@ class OrchestratorConfig:
 
     @property
     def api_base(self) -> str:
-        if self.mode == "cloud":
+        if self.mode in ("pat", "cloud"):
             return f"https://cloud.uipath.com/{self.organization}/{self.tenant}/orchestrator_/odata"
         return f"{self.base_url}/odata"
 

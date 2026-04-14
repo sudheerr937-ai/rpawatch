@@ -18,9 +18,10 @@ class AuthenticationError(Exception):
 
 class OrchestratorClient:
     """
-    Unified client for UiPath Orchestrator — works with both
-    Automation Cloud (OAuth2 client credentials) and On-Premises
-    (username/password bearer token).
+    Unified client for UiPath Orchestrator — works with:
+    - Automation Cloud with Personal Access Token (Community plan)
+    - Automation Cloud with OAuth2 client credentials (Enterprise plan)
+    - On-Premises username/password
     """
 
     def __init__(self, config: OrchestratorConfig):
@@ -34,24 +35,33 @@ class OrchestratorClient:
     # ------------------------------------------------------------------ #
 
     def _ensure_authenticated(self):
-        """Re-authenticates if token is missing or within 60s of expiry."""
         if self._token and time.time() < self._token_expiry - 60:
             return
-        if self.config.mode == "cloud":
+        if self.config.mode == "pat":
+            self._auth_pat()
+        elif self.config.mode == "cloud":
             self._auth_cloud()
         else:
             self._auth_onprem()
 
+    def _auth_pat(self):
+        """Personal Access Token — works on Community and Enterprise plans."""
+        self._token = self.config.personal_access_token
+        self._token_expiry = time.time() + 86400  # 24 hours
+        self._set_auth_headers()
+        logger.info("Authenticated with Personal Access Token.")
+
     def _auth_cloud(self):
-        """OAuth2 client credentials flow for UiPath Automation Cloud."""
+        """OAuth2 client credentials — Enterprise plans only."""
         resp = requests.post(
             CLOUD_AUTH_URL,
-            json={
+            data={
                 "grant_type": "client_credentials",
                 "client_id": self.config.client_id,
                 "client_secret": self.config.client_secret,
-                "audience": "https://orchestrator.cloud.uipath.com",
+                "scope": "OR.Jobs OR.Jobs.Read OR.Queues OR.Queues.Read OR.Robots OR.Robots.Read OR.Folders OR.Folders.Read",
             },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
             timeout=15,
         )
         if not resp.ok:
@@ -65,7 +75,7 @@ class OrchestratorClient:
         logger.info("Authenticated with UiPath Automation Cloud.")
 
     def _auth_onprem(self):
-        """Username/password authentication for On-Premises Orchestrator."""
+        """Username/password for On-Premises Orchestrator."""
         resp = requests.post(
             f"{self.config.base_url}/api/account/authenticate",
             json={
@@ -80,7 +90,6 @@ class OrchestratorClient:
                 f"On-prem auth failed [{resp.status_code}]: {resp.text}"
             )
         self._token = resp.json()["result"]
-        # On-prem tokens typically last 30 minutes
         self._token_expiry = time.time() + 1800
         self._set_auth_headers()
         logger.info("Authenticated with On-Premises Orchestrator.")
@@ -106,14 +115,9 @@ class OrchestratorClient:
     # ------------------------------------------------------------------ #
 
     def get_jobs_summary(self, lookback_minutes: int = 5) -> list[dict[str, Any]]:
-        """
-        Returns job counts grouped by (process_name, state) for the
-        lookback window. Used to compute faulted rates per process.
-        """
         since = (
             datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
         ).strftime("%Y-%m-%dT%H:%M:%SZ")
-
         data = self._get(
             "Jobs",
             params={
@@ -133,57 +137,47 @@ class OrchestratorClient:
         return data.get("value", [])
 
     def get_queue_items_summary(self) -> list[dict[str, Any]]:
-        """
-        Returns all non-processed queue items to measure pending depth
-        and failure counts per queue.
-        """
-        data = self._get(
-            "QueueItems",
-            params={
-                "$filter": "Status eq 'New' or Status eq 'InProgress' or Status eq 'Failed' or Status eq 'Retried'",
-                "$select": "Status,QueueDefinitionId,StartProcessing,EndProcessing",
-                "$top": 1000,
-            },
-        )
-        return data.get("value", [])
+        try:
+            data = self._get(
+                "QueueItems",
+                params={
+                    "$filter": "Status eq 'New' or Status eq 'InProgress' or Status eq 'Failed' or Status eq 'Retried'",
+                    "$select": "Status,QueueDefinitionId,StartProcessing,EndProcessing",
+                    "$top": 100,
+                },
+            )
+            return data.get("value", [])
+        except Exception as e:
+            logger.warning("QueueItems fetch failed — skipping: %s", e)
+            return []
 
     # ------------------------------------------------------------------ #
     #  Robots / Sessions                                                    #
     # ------------------------------------------------------------------ #
 
     def get_robot_sessions(self) -> list[dict[str, Any]]:
-        """
-        Returns current robot session states. Falls back to /Robots
-        if /Sessions is not available (older Orchestrator versions).
-        """
         try:
-            data = self._get(
-                "Sessions",
-                params={"$select": "State,RobotName,HostMachineName,IsConnected"},
-            )
+            data = self._get("Sessions", params={"$select": "State,RobotName,HostMachineName,IsConnected"})
             return data.get("value", [])
-        except requests.HTTPError as e:
-            if e.response.status_code == 404:
-                logger.warning(
-                    "Sessions endpoint not found — falling back to /Robots."
-                )
+        except Exception as e:
+            logger.warning("Sessions endpoint failed — falling back to /Robots: %s", e)
+            try:
                 return self._get_robots_fallback()
-            raise
+            except Exception as e2:
+                logger.warning("Robots fallback also failed — skipping: %s", e2)
+                return []
 
     def _get_robots_fallback(self) -> list[dict[str, Any]]:
         data = self._get(
             "Robots",
             params={"$select": "Name,Status,IsConnected,HostMachineName"},
         )
-        # Normalise field names to match Sessions schema
         robots = []
         for r in data.get("value", []):
-            robots.append(
-                {
-                    "RobotName": r.get("Name"),
-                    "State": r.get("Status"),
-                    "HostMachineName": r.get("HostMachineName"),
-                    "IsConnected": r.get("IsConnected", False),
-                }
-            )
+            robots.append({
+                "RobotName": r.get("Name"),
+                "State": r.get("Status"),
+                "HostMachineName": r.get("HostMachineName"),
+                "IsConnected": r.get("IsConnected", False),
+            })
         return robots
